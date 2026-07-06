@@ -202,7 +202,10 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
     int N_train = (int)pos_embed_raw->ne[1];
     int sqrt_N = (int)std::round(std::sqrt((float)(N_train - 1)));
 
-    const float* pos_ptr = (const float*)pos_embed_raw->data;
+    // Get pos_embed data on host (works for both CPU and GPU backends)
+    std::vector<float> pos_embed_host;
+    weight_to_host_f32(ml, "pretrained.pos_embed", pos_embed_host);
+    const float* pos_ptr = pos_embed_host.data();
 
     std::vector<float> cls_pos_data(embed);
     for (int d = 0; d < embed; ++d) {
