@@ -57,7 +57,7 @@ Backend::Backend(int n_threads) : impl_(new Impl()) {
                 impl_->backend = ggml_backend_dev_init(dev, nullptr);
                 if (impl_->backend) {
                     device_name_ = ggml_backend_dev_name(dev);
-                    impl_->use_sched = true;
+                    impl_->use_sched = true; // Always use scheduler for GPU
                     DA_LOG("da::Backend using GPU device: %s", device_name_.c_str());
                     break;
                 }
@@ -156,16 +156,8 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
         ggml_build_forward_expand(gf, pc.tensor);
     ggml_build_forward_expand(gf, output);
 
-    bool need_sched = false;
-    if (impl_->use_sched) {
-        const int n_nodes = ggml_graph_n_nodes(gf);
-        for (int i = 0; i < n_nodes; ++i) {
-            if (!ggml_backend_supports_op(impl_->backend, ggml_graph_node(gf, i))) {
-                need_sched = true;
-                break;
-            }
-        }
-    }
+    // Always use scheduler to avoid gallocr reallocation issues with GPU
+    bool need_sched = impl_->use_sched; // true for GPU, forces sched path
 
     bool alloc_ok = false;
     if (need_sched) {
@@ -196,9 +188,17 @@ bool Backend::compute(const std::function<ggml_tensor*(ggml_context*)>& build,
                 ggml_free(ctx);
                 return false;
             }
+            // Pre-reserve to avoid reallocation bug
+            ggml_gallocr_reserve(impl_->galloc, gf);
         }
         alloc_ok = ggml_gallocr_alloc_graph(impl_->galloc, gf);
-        if (!alloc_ok) DA_LOG("Backend::compute: ggml_gallocr_alloc_graph failed");
+        if (!alloc_ok) {
+            // If alloc fails, try reserve again (graph may have grown)
+            if (ggml_gallocr_reserve(impl_->galloc, gf)) {
+                alloc_ok = ggml_gallocr_alloc_graph(impl_->galloc, gf);
+            }
+            if (!alloc_ok) DA_LOG("Backend::compute: ggml_gallocr_alloc_graph failed");
+        }
     }
     if (!alloc_ok) {
         impl_->pending.clear();
