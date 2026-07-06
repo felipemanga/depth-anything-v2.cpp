@@ -1,0 +1,21 @@
+# Build
+build/
+cmake-build-*/
+
+# Models (convert from .pth instead)
+*.gguf
+
+# Outputs
+depth_*.png
+depth_raw.png
+depth_colored.png
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
