@@ -84,6 +84,10 @@ def convert_checkpoint(checkpoint_path, output_path, quantize="f32"):
             continue
         tensor = state_dict[name]
         data = tensor.detach().cpu().numpy().astype(np.float32)
+        # Ensure conv2d weights are always 4D [cout, cin, kh, kw]
+        if "conv" in name and "weight" in name and data.ndim < 4:
+            while data.ndim < 4:
+                data = np.expand_dims(data, -1)
         if quantize == "f16":
             data = data.astype(np.float16)
         gguf.add_tensor(name, data)

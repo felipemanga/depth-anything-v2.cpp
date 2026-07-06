@@ -25,21 +25,10 @@ std::vector<float>& get_transposed_conv2d_weight(const ModelLoader& ml, const st
     ggml_tensor* src = ml.tensor(name.c_str());
     assert(src && "conv2d weight not found");
 
-    // Some GGUF files store 1x1 conv weights with squeezed dimensions:
-    // 4D: [kw, kh, cin, cout] (full)
-    // 3D: [kw, kh, cin] with cout=1
-    // 2D: [kh, cin] with kw=1, cout=1
-    int ndims = ggml_n_dims(src);
-    int64_t kw, kh, cin_, cout_;
-    if (ndims == 4) {
-        kw = src->ne[0]; kh = src->ne[1]; cin_ = src->ne[2]; cout_ = src->ne[3];
-    } else if (ndims == 3) {
-        kw = src->ne[0]; kh = src->ne[1]; cin_ = src->ne[2]; cout_ = 1;
-    } else if (ndims == 2) {
-        kh = src->ne[0]; cin_ = src->ne[1]; kw = 1; cout_ = 1;
-    } else {
-        assert(false && "conv2d weight must be 2D-4D");
-    }
+    assert(ggml_n_dims(src) == 4 && "conv2d weight must be 4D");
+
+    // src->ne is ggml order [kw,kh,cin,cout] after GGML shape reversal
+    int64_t kw = src->ne[0], kh = src->ne[1], cin_ = src->ne[2], cout_ = src->ne[3];
     ne[0] = kw; ne[1] = kh; ne[2] = cin_; ne[3] = cout_;
 
     auto it = g_conv2d_cache.find(name);
