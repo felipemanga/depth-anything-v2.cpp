@@ -15,7 +15,7 @@ C++ port of [Depth-Anything-V2](https://github.com/DepthAnything/Depth-Anything-
 ### Build
 
 ```bash
-git clone --recursive https://github.com/<your-user>/depth-anything-v2.cpp.git
+git clone --recursive https://github.com/felipemanga/depth-anything-v2.cpp.git
 cd depth-anything-v2.cpp
 
 # CPU only
