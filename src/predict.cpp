@@ -12,11 +12,20 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#include <chrono>
 
 namespace da {
 
 static constexpr float IMAGENET_MEAN[3]  = {0.485f, 0.456f, 0.406f};
 static constexpr float IMAGENET_STD[3]   = {0.229f, 0.224f, 0.225f};
+
+// Profiling helper
+static std::chrono::steady_clock::time_point g_perf_start = std::chrono::steady_clock::now();
+static void perf_log(const char* section) {
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g_perf_start).count();
+    DA_LOG("[PERF] %s: %.1fms", section, ms);
+    g_perf_start = std::chrono::steady_clock::now();
+}
 
 // Cubic interpolation kernel (OpenCV a=-0.75)
 static float cubic_kernel(float t) {
@@ -98,8 +107,8 @@ PreprocessedImage preprocess(const Image& img, uint32_t target_size, uint32_t pa
 }
 
 static ggml_tensor* vit_block(ggml_context* ctx, ggml_tensor* x,
-                              const ModelLoader& ml, int block_idx,
-                              const DAConfig& cfg) {
+                               const ModelLoader& ml, int block_idx,
+                               const DAConfig& cfg) {
     std::string prefix = "pretrained.blocks." + std::to_string(block_idx) + ".";
 
     ggml_tensor* norm1 = layer_norm(ctx, x,
@@ -130,14 +139,18 @@ static ggml_tensor* vit_block(ggml_context* ctx, ggml_tensor* x,
     return x;
 }
 
-// Build ViT encoder graph up to (and including) block `stop_block`
-static ggml_tensor* build_vit_to_block(ggml_context* ctx,
-    const ModelLoader& ml, const DAConfig& cfg, int stop_block,
+// Build entire ViT encoder in one pass, capturing intermediate block outputs.
+// The build lambda calls capture_graph_output() for all but the last intermediate,
+// and returns the last intermediate as the main output.
+static ggml_tensor* build_vit_all_blocks(ggml_context* ctx,
+    const ModelLoader& ml, const DAConfig& cfg,
     int num_patches, int embed,
     const std::vector<float>& ggml_input,
     const std::vector<float>& cls_pos_data,
     const std::vector<float>& patch_pos_data,
-    int input_w, int input_h) {
+    int input_w, int input_h,
+    const std::vector<int32_t>& inter_layers,
+    std::vector<std::vector<float>*> & captureDsts) {
 
     // Patch embedding
     ggml_tensor* x_img = graph_input_tensor(ctx, GGML_TYPE_F32, 4,
@@ -164,18 +177,35 @@ static ggml_tensor* build_vit_to_block(ggml_context* ctx,
     ggml_tensor* patches_with_pos = ggml_add(ctx, patches_flat, patch_pos_input);
     ggml_tensor* x = ggml_concat(ctx, cls_with_pos, patches_with_pos, 0);
 
-    // Transformer blocks up to stop_block
-    for (int i = 0; i <= stop_block; ++i) {
+    // Final encoder norm weights (shared across all intermediate captures)
+    ggml_tensor* fnorm_w = clone_weight(ctx, ml, "pretrained.norm.weight");
+    ggml_tensor* fnorm_b = clone_weight(ctx, ml, "pretrained.norm.bias");
+
+    int n_inter = (int)inter_layers.size();
+    ggml_tensor* lastIntermediate = nullptr;
+
+    // Run ALL transformer blocks, capturing intermediates as we go
+    for (int i = 0; i < (int)cfg.depth; ++i) {
         x = vit_block(ctx, x, ml, i, cfg);
+
+        // Check if this block index is in our intermediate layers list
+        for (int ci = 0; ci < n_inter; ++ci) {
+            if (i == inter_layers[ci]) {
+                // Apply final encoder norm and capture
+                ggml_tensor* normed = layer_norm(ctx, x, fnorm_w, fnorm_b);
+                if (ci < n_inter - 1) {
+                    // Capture all but the last intermediate
+                    capture_graph_output(normed, captureDsts[ci]);
+                } else {
+                    // Last intermediate is the main output
+                    lastIntermediate = normed;
+                }
+                break;
+            }
+        }
     }
 
-    // DINOv2 get_intermediate_layers(..., norm=True) applies final encoder norm
-    // to every tapped block output.
-    x = layer_norm(ctx, x,
-        clone_weight(ctx, ml, "pretrained.norm.weight"),
-        clone_weight(ctx, ml, "pretrained.norm.bias"));
-
-    return x;
+    return lastIntermediate;
 }
 
 std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input, int n_threads) {
@@ -187,6 +217,7 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
     int embed = (int)cfg.embed_dim;
 
     // Convert CHW -> WHC for ggml conv2d
+    g_perf_start = std::chrono::steady_clock::now();
     std::vector<float> ggml_input((size_t)input.w * input.h * 3);
     for (int c = 0; c < 3; ++c) {
         for (int y = 0; y < input.h; ++y) {
@@ -259,37 +290,44 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
         }
     }
 
-    // === CAPTURE INTERMEDIATE FEATURES ===
-    // Run ViT encoder 4 times, each stopping at a different intermediate block
+    perf_log("cpu_prep (CHW+pos_embed)");
+
+    // === CAPTURE INTERMEDIATE FEATURES (single-pass) ===
+    // Run ViT encoder once, capturing all intermediate block outputs simultaneously
     const std::vector<int32_t>& inter_layers = cfg.intermediate_layers;
     int n_inter = (int)inter_layers.size();
 
     std::vector<std::vector<float>> inter_features(n_inter);
+    std::vector<std::vector<float>*> captureDsts(n_inter);
+    for (int i = 0; i < n_inter; ++i) captureDsts[i] = &inter_features[i];
 
+    bool vitOk = da::run_graph(0, n_threads, [&](ggml_context* ctx) -> ggml_tensor* {
+        return build_vit_all_blocks(ctx, ml, cfg,
+            num_patches, embed, ggml_input, cls_pos_data, patch_pos_data,
+            input.w, input.h, inter_layers, captureDsts);
+    }, inter_features[n_inter - 1]);
+
+    if (!vitOk) {
+        DA_LOG("predict: ViT encoder (single-pass) failed");
+        return {};
+    }
+    DA_LOG("predict: ViT single-pass captured %d intermediates", n_inter);
+
+    perf_log("vit_single_pass");
+
+    // Extract patch tokens (skip cls at row 0) from all intermediates
     for (int i = 0; i < n_inter; ++i) {
-        std::vector<float> vit_output;
-        bool ok = da::run_graph(0, n_threads, [&](ggml_context* ctx) -> ggml_tensor* {
-            ggml_tensor* x = build_vit_to_block(ctx, ml, cfg, (int)inter_layers[i],
-                num_patches, embed, ggml_input, cls_pos_data, patch_pos_data,
-                input.w, input.h);
-            // [N+1, D] - return as-is
-            return x;
-        }, vit_output);
-
-        if (!ok) {
-            DA_LOG("predict: ViT encoder block %d failed", (int)inter_layers[i]);
-            return {};
-        }
-
-        // Extract patch tokens (skip cls at row 0)
-        inter_features[i].resize((size_t)num_patches * embed);
+        std::vector<float> patchTokens((size_t)num_patches * embed);
+        const auto& vitOut = inter_features[i];
         for (int p = 0; p < num_patches; ++p) {
             for (int d = 0; d < embed; ++d) {
-                inter_features[i][p + d * num_patches] = vit_output[(p + 1) + d * (num_patches + 1)];
+                patchTokens[p + d * num_patches] = vitOut[(p + 1) + d * (num_patches + 1)];
             }
         }
-
+        inter_features[i] = std::move(patchTokens);
     }
+
+    perf_log("patch_token_extraction");
 
     // === DPT HEAD ===
     int head_feat = (int)cfg.head_features;
@@ -353,8 +391,10 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
         layer_rn_sizes[i] = {resized_h[i], resized_w[i]};
     }
 
+    perf_log("dpt_head");
+
     // === REFINET BLOCKS ===
-    // refinenet4 → refinenet3 → refinenet2 → refinenet1
+    // CPU bilinear (OpenMP-parallelized) between GPU resConfUnit + out_conv stages
 
     std::vector<float> refinenet_out;
     std::pair<int, int> refinenet_size;
@@ -367,13 +407,11 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
         bool ok = da::run_graph(0, n_threads, [&](ggml_context* ctx) -> ggml_tensor* {
             ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, x_w, x_h, head_feat, 1);
             add_graph_input(x, x_data.data(), x_data.size() * sizeof(float));
-
-            std::string prefix = "depth_head.scratch.refinenet4.";
             x = residual_conv_unit(ctx, x, ml,
-                (prefix + "resConfUnit2.conv1.weight").c_str(),
-                (prefix + "resConfUnit2.conv1.bias").c_str(),
-                (prefix + "resConfUnit2.conv2.weight").c_str(),
-                (prefix + "resConfUnit2.conv2.bias").c_str());
+                "depth_head.scratch.refinenet4.resConfUnit2.conv1.weight",
+                "depth_head.scratch.refinenet4.resConfUnit2.conv1.bias",
+                "depth_head.scratch.refinenet4.resConfUnit2.conv2.weight",
+                "depth_head.scratch.refinenet4.resConfUnit2.conv2.bias");
             return ggml_reshape_1d(ctx, x, (int64_t)x_w * x_h * head_feat);
         }, refinenet_out);
 
@@ -399,11 +437,9 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
                 (int64_t)refinenet_size.second * refinenet_size.first * head_feat);
         }, refinenet_out);
         if (!ok) { DA_LOG("predict: refinenet4 out_conv failed"); return {}; }
-
     }
 
-    // refinenet3, refinenet2, refinenet1: (path + resConfUnit1(skip)) -> resConfUnit2
-    // -> upsample -> out_conv
+    // refinenet3, refinenet2, refinenet1
     for (int rn = 3; rn >= 1; --rn) {
         int skip_idx = rn - 1;
         const auto& skip_data = layer_rn_data[skip_idx];
@@ -413,7 +449,6 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
         bool ok = da::run_graph(0, n_threads, [&](ggml_context* ctx) -> ggml_tensor* {
             ggml_tensor* skip = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, skip_w, skip_h, head_feat, 1);
             add_graph_input(skip, skip_data.data(), skip_data.size() * sizeof(float));
-
             ggml_tensor* path = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
                 refinenet_size.second, refinenet_size.first, head_feat, 1);
             add_graph_input(path, refinenet_out.data(), refinenet_out.size() * sizeof(float));
@@ -424,7 +459,6 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
                 (prefix + "resConfUnit1.conv1.bias").c_str(),
                 (prefix + "resConfUnit1.conv2.weight").c_str(),
                 (prefix + "resConfUnit1.conv2.bias").c_str());
-
             ggml_tensor* output = ggml_add(ctx, path, res);
             output = residual_conv_unit(ctx, output, ml,
                 (prefix + "resConfUnit2.conv1.weight").c_str(),
@@ -434,19 +468,10 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
             return ggml_reshape_1d(ctx, output,
                 (int64_t)refinenet_size.second * refinenet_size.first * head_feat);
         }, refinenet_out);
-
         if (!ok) { DA_LOG("predict: refinenet%d failed", rn); return {}; }
 
-        int th = 0, tw = 0;
-        if (rn > 1) {
-            int next_idx = rn - 2;
-            th = layer_rn_sizes[next_idx].first;
-            tw = layer_rn_sizes[next_idx].second;
-        } else {
-            th = refinenet_size.first * 2;
-            tw = refinenet_size.second * 2;
-        }
-
+        int th = (rn > 1) ? layer_rn_sizes[rn - 2].first : refinenet_size.first * 2;
+        int tw = (rn > 1) ? layer_rn_sizes[rn - 2].second : refinenet_size.second * 2;
         std::vector<float> up((size_t)tw * th * head_feat);
         bilinear_upscale_host_corners(refinenet_out.data(), up.data(),
             refinenet_size.second, refinenet_size.first, head_feat, 1, tw, th);
@@ -465,16 +490,33 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
             return ggml_reshape_1d(ctx, x,
                 (int64_t)refinenet_size.second * refinenet_size.first * head_feat);
         }, refinenet_out);
-
         if (!ok) { DA_LOG("predict: refinenet%d out_conv failed", rn); return {}; }
-
     }
 
-    // === OUTPUT CONVOlUTIONS ===
+    perf_log("refinet_blocks");
+
+    // === OUTPUT CONVOlUTIONS (GPU-accelerated) ===
+    // Combine output_conv1 + bilinear upscale + output_conv2 into ONE GPU graph.
+    // Bilinear upscale uses two conv_transpose2d passes (2× each = 4× total),
+    // then postprocess resizes to original image size (single-channel, cheap).
     int final_h = refinenet_size.first;
     int final_w = refinenet_size.second;
 
-    std::vector<float> conv1_out;
+    // Pre-allocate bilinear kernel weights OUTSIDE the lambda to guarantee lifetime
+    float k1d[3] = {0.5f, 1.0f, 0.5f};
+    std::vector<float> bilinear_weights((size_t)3 * 3 * head_feat_half * head_feat_half);
+    for (int cin = 0; cin < head_feat_half; ++cin) {
+        for (int cout = 0; cout < head_feat_half; ++cout) {
+            for (int ky = 0; ky < 3; ++ky) {
+                for (int kx = 0; kx < 3; ++kx) {
+                    size_t idx = kx + 3 * ky + 9 * cout + 9 * head_feat_half * cin;
+                    bilinear_weights[idx] = (cin == cout) ? k1d[kx] * k1d[ky] : 0.0f;
+                }
+            }
+        }
+    }
+
+    std::vector<float> depth_output;
     bool ok = da::run_graph(0, n_threads, [&](ggml_context* ctx) -> ggml_tensor* {
         ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, final_w, final_h, head_feat, 1);
         add_graph_input(x, refinenet_out.data(), refinenet_out.size() * sizeof(float));
@@ -482,39 +524,37 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
             "depth_head.scratch.output_conv1.weight",
             "depth_head.scratch.output_conv1.bias",
             3, 3, 1, 1, 1, 1);
-        return ggml_reshape_1d(ctx, x, (int64_t)final_w * final_h * head_feat_half);
-    }, conv1_out);
 
-    if (!ok) { DA_LOG("predict: output_conv1 failed"); return {}; }
+        // Two 2× bilinear upscale passes via conv_transpose2d
+        for (int pass = 0; pass < 2; ++pass) {
+            ggml_tensor* W = graph_input_tensor(ctx, GGML_TYPE_F32, 4,
+                (int64_t[]){3, 3, head_feat_half, head_feat_half},
+                bilinear_weights.data(), bilinear_weights.size() * sizeof(float));
+            x = ggml_conv_transpose_2d_p0(ctx, W, x, 2);
+        }
 
-    // Bilinear upscale to [p_h*14, p_w*14]
-    int up_h = p_h * 14, up_w = p_w * 14;
-    std::vector<float> upsampled((size_t)up_w * up_h * head_feat_half);
-    bilinear_upscale_host_corners(conv1_out.data(), upsampled.data(),
-        final_w, final_h, head_feat_half, 1, up_w, up_h);
-
-    // output_conv2
-    std::vector<float> depth_output;
-    ok = da::run_graph(0, n_threads, [&](ggml_context* ctx) -> ggml_tensor* {
-        ggml_tensor* y = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, up_w, up_h, head_feat_half, 1);
-        add_graph_input(y, upsampled.data(), upsampled.size() * sizeof(float));
-        y = conv2d(ctx, y, ml,
+        // output_conv2
+        x = conv2d(ctx, x, ml,
             "depth_head.scratch.output_conv2.0.weight",
             "depth_head.scratch.output_conv2.0.bias",
             3, 3, 1, 1, 1, 1);
-        y = ggml_relu(ctx, y);
-        y = conv2d(ctx, y, ml,
+        x = ggml_relu(ctx, x);
+        x = conv2d(ctx, x, ml,
             "depth_head.scratch.output_conv2.2.weight",
             "depth_head.scratch.output_conv2.2.bias",
             1, 1, 1, 1, 0, 0);
-        y = ggml_relu(ctx, y);
-        return ggml_reshape_1d(ctx, y, (int64_t)up_w * up_h);
+        x = ggml_relu(ctx, x);
+        return ggml_reshape_1d(ctx, x, ggml_nelements(x));
     }, depth_output);
 
-    if (!ok) { DA_LOG("predict: output_conv2 failed"); return {}; }
+    if (!ok) { DA_LOG("predict: output_conv GPU failed"); return {}; }
 
-    std::vector<float> depth_full = postprocess_depth(depth_output, up_h, up_w,
+    // GPU upscale produced (4*final_w+3) × (4*final_h+3), resize to original on CPU
+    int gpu_up_h = 2 * (2 * final_h + 1) + 1;
+    int gpu_up_w = 2 * (2 * final_w + 1) + 1;
+    std::vector<float> depth_full = postprocess_depth(depth_output, gpu_up_h, gpu_up_w,
         input.orig_h, input.orig_w);
+    perf_log("output_convs+postprocess");
     return depth_full;
 }
 

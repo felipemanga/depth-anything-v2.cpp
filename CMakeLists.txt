@@ -4,6 +4,11 @@ project(depth-anything LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+find_package(OpenMP QUIET)
+if (OPENMP_FOUND)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+endif()
+
 option(DA_CUDA   "Enable CUDA backend" OFF)
 option(DA_METAL  "Enable Metal backend" OFF)
 option(DA_VULKAN "Enable Vulkan backend" OFF)
@@ -34,6 +39,9 @@ add_library(depth-anything STATIC
 )
 target_include_directories(depth-anything PUBLIC include PRIVATE src)
 target_link_libraries(depth-anything PUBLIC ggml)
+if (OPENMP_FOUND)
+    target_link_libraries(depth-anything PRIVATE OpenMP::OpenMP_CXX)
+endif()
 
 add_subdirectory(examples/cli)
 add_subdirectory(tests)

@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cassert>
 #include <cstring>
+#include <vector>
+#include <omp.h>
 
 namespace da {
 
@@ -131,40 +133,43 @@ void bilinear_upscale_host(const float* input, float* output,
     }
 }
 
-// Host-side bilinear interpolation (align_corners=True)
+// Host-side bilinear interpolation (align_corners=True), OpenMP-parallelized
 // Used by DPT refinenet blocks
 void bilinear_upscale_host_corners(const float* input, float* output,
-                                    int in_w, int in_h, int c, int batch,
-                                    int out_w, int out_h) {
-    for (int n = 0; n < batch; ++n) {
-        for (int oh = 0; oh < out_h; ++oh) {
-            for (int ow = 0; ow < out_w; ++ow) {
-                // align_corners=True: map corners exactly
-                float sx = (out_w > 1) ? ((float)ow / (out_w - 1)) * (in_w - 1) : 0.0f;
-                float sy = (out_h > 1) ? ((float)oh / (out_h - 1)) * (in_h - 1) : 0.0f;
+                                     int in_w, int in_h, int c, int batch,
+                                     int out_w, int out_h) {
+    // Precompute source coordinates for each output row
+    std::vector<int> sx_floor(out_h), sy_floor(out_h);
+    std::vector<float> sdx(out_h), sdy(out_h);
+    std::vector<int> x0s(out_h), x1s(out_h), y0s(out_h), y1s(out_h);
 
-                int x0 = (int)std::floor(sx);
-                int y0 = (int)std::floor(sy);
-                int x1 = std::min(x0 + 1, in_w - 1);
-                int y1 = std::min(y0 + 1, in_h - 1);
-                x0 = std::max(0, x0); y0 = std::max(0, y0);
+    for (int oh = 0; oh < out_h; ++oh) {
+        float sy = (out_h > 1) ? ((float)oh / (out_h - 1)) * (in_h - 1) : 0.0f;
+        int y0 = (int)std::floor(sy);
+        int y1 = std::min(y0 + 1, in_h - 1);
+        y0 = std::max(0, y0);
+        sy_floor[oh] = y0; y1s[oh] = y1; sdy[oh] = sy - y0;
+    }
 
-                float dx = sx - x0;
-                float dy = sy - y0;
+#pragma omp parallel for collapse(2) schedule(static)
+    for (int oh = 0; oh < out_h; ++oh) {
+        for (int ow = 0; ow < out_w; ++ow) {
+            float sx = (out_w > 1) ? ((float)ow / (out_w - 1)) * (in_w - 1) : 0.0f;
+            int x0 = std::max(0, (int)std::floor(sx));
+            int x1 = std::min(x0 + 1, in_w - 1);
+            float dx = sx - x0;
 
-                for (int ch = 0; ch < c; ++ch) {
-                    size_t idx00 = (size_t)x0 + (size_t)y0 * in_w + (size_t)ch * in_w * in_h + (size_t)n * in_w * in_h * c;
-                    size_t idx10 = (size_t)x1 + (size_t)y0 * in_w + (size_t)ch * in_w * in_h + (size_t)n * in_w * in_h * c;
-                    size_t idx01 = (size_t)x0 + (size_t)y1 * in_w + (size_t)ch * in_w * in_h + (size_t)n * in_w * in_h * c;
-                    size_t idx11 = (size_t)x1 + (size_t)y1 * in_w + (size_t)ch * in_w * in_h + (size_t)n * in_w * in_h * c;
-                    float v00 = input[idx00];
-                    float v10 = input[idx10];
-                    float v01 = input[idx01];
-                    float v11 = input[idx11];
-                    float val = v00*(1-dx)*(1-dy) + v10*dx*(1-dy) + v01*(1-dx)*dy + v11*dx*dy;
-                    size_t oidx = (size_t)ow + (size_t)oh * out_w + (size_t)ch * out_w * out_h + (size_t)n * out_w * out_h * c;
-                    output[oidx] = val;
-                }
+            int y0 = sy_floor[oh], y1 = y1s[oh];
+            float dy = sdy[oh];
+
+            for (int ch = 0; ch < c; ++ch) {
+                size_t ci00 = (size_t)x0 + (size_t)y0 * in_w + (size_t)ch * in_w * in_h;
+                size_t ci10 = (size_t)x1 + (size_t)y0 * in_w + (size_t)ch * in_w * in_h;
+                size_t ci01 = (size_t)x0 + (size_t)y1 * in_w + (size_t)ch * in_w * in_h;
+                size_t ci11 = (size_t)x1 + (size_t)y1 * in_w + (size_t)ch * in_w * in_h;
+                float val = input[ci00]*(1-dx)*(1-dy) + input[ci10]*dx*(1-dy) +
+                            input[ci01]*(1-dx)*dy + input[ci11]*dx*dy;
+                output[ow + (size_t)oh * out_w + (size_t)ch * out_w * out_h] = val;
             }
         }
     }

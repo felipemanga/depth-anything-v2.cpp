@@ -77,8 +77,8 @@ bool run_graph(size_t mem_bytes, int n_threads,
 }
 
 bool run_graph_sync(size_t /*mem_bytes*/, int n_threads,
-                    const std::function<ggml_tensor*(ggml_context*)>& build,
-                    std::vector<float>& out) {
+                     const std::function<ggml_tensor*(ggml_context*)>& build,
+                     std::vector<float>& out) {
     // No lock - caller must hold lock or ensure no concurrent access
     Backend& be = global_backend();
     const int g = g_num_threads.load(std::memory_order_relaxed);
