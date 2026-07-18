@@ -237,18 +237,11 @@ ggml_tensor* self_attention(ggml_context* ctx, ggml_tensor* x,
     k_h = ggml_cont(ctx, ggml_permute(ctx, k_h, 0, 2, 1, 3));
     v_h = ggml_cont(ctx, ggml_permute(ctx, v_h, 0, 2, 1, 3));
 
-    // Per-head attention (no cross-head mixing):
-    // k_h/q_h: [head_dim, seq, heads] -> attn: [seq(key), seq(query), heads]
-    ggml_tensor* attn = ggml_mul_mat(ctx, k_h, q_h);
+    // Flash attention: [head_dim, seq, heads] -> [head_dim, heads, seq] (no full attn matrix)
     float scale = 1.0f / std::sqrt((float)head_dim);
-    attn = ggml_scale(ctx, attn, scale);
-    attn = ggml_soft_max(ctx, attn);
+    ggml_tensor* out_h = ggml_flash_attn_ext(ctx, q_h, k_h, v_h, nullptr, scale, 0.0f, 0.0f);
 
-    // Context per head: [seq, head_dim, heads] x [seq, seq, heads] -> [head_dim, seq, heads]
-    ggml_tensor* v_t = ggml_cont(ctx, ggml_permute(ctx, v_h, 1, 0, 2, 3));
-    ggml_tensor* out_h = ggml_mul_mat(ctx, v_t, attn);
-
-    // Merge heads: [head_dim, seq, heads] -> [head_dim, heads, seq] -> [embed, seq] -> [seq, embed]
+    // Merge heads: [head_dim, heads, seq] -> [head_dim, seq, heads] -> [embed, seq] -> [seq, embed]
     ggml_tensor* merged = ggml_cont(ctx, ggml_permute(ctx, out_h, 0, 2, 1, 3));
     ggml_tensor* out = ggml_reshape_2d(ctx, merged, embed_dim, seq_len);
     out = ggml_cont(ctx, ggml_transpose(ctx, out));
