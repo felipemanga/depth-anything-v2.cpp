@@ -28,9 +28,6 @@ bool run_graph_sync(size_t mem_bytes, int n_threads,
 void set_num_threads(int n);
 int  num_threads();
 
-// Register a tensor for capture (its data will be downloaded after graph execution)
-void capture_graph_output(ggml_tensor* t, std::vector<float>* dst);
-
 class Backend;
 Backend& global_backend();
 void shutdown_backend();

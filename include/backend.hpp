@@ -50,7 +50,6 @@ void add_graph_input(ggml_tensor* t, const void* host, size_t nbytes);
 ggml_tensor* graph_input_tensor(ggml_context* ctx, int type, int n_dims,
                                 const int64_t* ne, const void* host,
                                 size_t nbytes);
-void capture_graph_output(ggml_tensor* t, std::vector<float>* dst);
 ggml_tensor* clone_weight(ggml_context* ctx, const ModelLoader& ml,
                           const char* name);
 ggml_tensor* clone_weight_opt(ggml_context* ctx, const ModelLoader& ml,

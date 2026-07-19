@@ -77,19 +77,7 @@ ggml_tensor* bilinear_upscale(ggml_context* ctx, ggml_tensor* x, int target_h, i
 // Used in DPT head refinenet blocks
 ggml_tensor* residual_conv_unit(ggml_context* ctx, ggml_tensor* x,
                                  const ModelLoader& ml,
-                                 const char* conv1_w_name, const char* conv1_b_name,
-                                 const char* conv2_w_name, const char* conv2_b_name);
-
-// Host-side bilinear interpolation (used by predict.cpp for postprocessing)
-// align_corners=False: uses (x+0.5)*ratio-0.5 formula
-void bilinear_upscale_host(const float* input, float* output,
-                            int in_w, int in_h, int c, int batch,
-                            int out_w, int out_h);
-
-// Host-side bilinear interpolation with align_corners=True
-// Used by DPT refinenet blocks
-void bilinear_upscale_host_corners(const float* input, float* output,
-                                    int in_w, int in_h, int c, int batch,
-                                    int out_w, int out_h);
+                                  const char* conv1_w_name, const char* conv1_b_name,
+                                  const char* conv2_w_name, const char* conv2_b_name);
 
 } // namespace da

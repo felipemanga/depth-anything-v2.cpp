@@ -3,50 +3,12 @@
 
 #include "vision_ops.hpp"
 #include "backend.hpp"
-#include "ggml_graph.hpp"
 #include "ggml.h"
 #include "common.hpp"
-#include <cmath>
 #include <cassert>
-#include <cstring>
-#include <vector>
-#include <omp.h>
+#include <cmath>
 
 namespace da {
-
-namespace {
-// Cached host copies of conv weights: name -> contiguous float data.
-std::unordered_map<std::string, std::vector<float>> g_conv2d_cache;
-std::mutex g_conv2d_mutex;
-}
-
-std::vector<float>& get_transposed_conv2d_weight(const ModelLoader& ml, const std::string& name,
-                                                     int64_t ne[4]) {
-    std::lock_guard<std::mutex> lock(g_conv2d_mutex);
-
-    ggml_tensor* src = ml.tensor(name.c_str());
-    assert(src && "conv2d weight not found");
-
-    assert(ggml_n_dims(src) == 4 && "conv2d weight must be 4D");
-
-    // src->ne is ggml order [kw,kh,cin,cout] after GGML shape reversal
-    int64_t kw = src->ne[0], kh = src->ne[1], cin_ = src->ne[2], cout_ = src->ne[3];
-    ne[0] = kw; ne[1] = kh; ne[2] = cin_; ne[3] = cout_;
-
-    auto it = g_conv2d_cache.find(name);
-    if (it != g_conv2d_cache.end()) {
-        return it->second;
-    }
-
-    std::vector<float> src_data;
-    weight_to_host_f32(ml, name.c_str(), src_data);
-
-    // ggml tensor memory for these conv weights already matches expected layout
-    // [kw, kh, cin, cout] for ggml_conv_2d, so we only cache a host copy.
-    auto& dst = g_conv2d_cache[name];
-    dst = std::move(src_data);
-    return dst;
-}
 
 ggml_tensor* linear(ggml_context* ctx, ggml_tensor* x,
                     const ModelLoader& ml, const char* w_name, const char* b_name) {
@@ -72,13 +34,10 @@ ggml_tensor* conv2d(ggml_context* ctx, ggml_tensor* x,
                     int kernel_h, int kernel_w,
                     int stride_h, int stride_w,
                     int pad_h, int pad_w) {
-    // We use a cached host copy of [kw, kh, cin, cout] weights.
-    int64_t ggml_ne[4];
-    std::vector<float>& wdata = get_transposed_conv2d_weight(ml, w_name, ggml_ne);
-
-    ggml_tensor* W = graph_input_tensor(ctx, GGML_TYPE_F32, 4, ggml_ne,
-        wdata.data(), wdata.size() * sizeof(float));
-
+    // Use GPU-resident weight tensor directly (like linear() does).
+    // GGUF stores conv weights as [kw, kh, cin, cout] after ggml shape reversal,
+    // which is exactly what ggml_conv_2d expects.
+    ggml_tensor* W = clone_weight(ctx, ml, w_name);
     ggml_tensor* y = ggml_conv_2d(ctx, W, x, stride_w, stride_h, pad_w, pad_h, 1, 1);
 
     {
@@ -91,88 +50,6 @@ ggml_tensor* conv2d(ggml_context* ctx, ggml_tensor* x,
         }
     }
     return y;
-}
-
-// Host-side bilinear interpolation (align_corners=False)
-void bilinear_upscale_host(const float* input, float* output,
-                            int in_w, int in_h, int c, int batch,
-                            int out_w, int out_h) {
-    float x_ratio = (float)in_w / (float)out_w;
-    float y_ratio = (float)in_h / (float)out_h;
-
-    for (int n = 0; n < batch; ++n) {
-        for (int oh = 0; oh < out_h; ++oh) {
-            for (int ow = 0; ow < out_w; ++ow) {
-                float sx = (ow + 0.5f) * x_ratio - 0.5f;
-                float sy = (oh + 0.5f) * y_ratio - 0.5f;
-
-                int x0 = (int)std::floor(sx);
-                int y0 = (int)std::floor(sy);
-                int x1 = std::min(x0 + 1, in_w - 1);
-                int y1 = std::min(y0 + 1, in_h - 1);
-                x0 = std::max(0, x0); y0 = std::max(0, y0);
-
-                float dx = sx - x0;
-                float dy = sy - y0;
-
-                for (int ch = 0; ch < c; ++ch) {
-                    size_t idx00 = (size_t)x0 + (size_t)y0 * in_w + (size_t)ch * in_w * in_h + (size_t)n * in_w * in_h * c;
-                    size_t idx10 = (size_t)x1 + (size_t)y0 * in_w + (size_t)ch * in_w * in_h + (size_t)n * in_w * in_h * c;
-                    size_t idx01 = (size_t)x0 + (size_t)y1 * in_w + (size_t)ch * in_w * in_h + (size_t)n * in_w * in_h * c;
-                    size_t idx11 = (size_t)x1 + (size_t)y1 * in_w + (size_t)ch * in_w * in_h + (size_t)n * in_w * in_h * c;
-                    float v00 = input[idx00];
-                    float v10 = input[idx10];
-                    float v01 = input[idx01];
-                    float v11 = input[idx11];
-                    float val = v00*(1-dx)*(1-dy) + v10*dx*(1-dy) + v01*(1-dx)*dy + v11*dx*dy;
-                    size_t oidx = (size_t)ow + (size_t)oh * out_w + (size_t)ch * out_w * out_h + (size_t)n * out_w * out_h * c;
-                    output[oidx] = val;
-                }
-            }
-        }
-    }
-}
-
-// Host-side bilinear interpolation (align_corners=True), OpenMP-parallelized
-// Used by DPT refinenet blocks
-void bilinear_upscale_host_corners(const float* input, float* output,
-                                     int in_w, int in_h, int c, int batch,
-                                     int out_w, int out_h) {
-    // Precompute source coordinates for each output row
-    std::vector<int> sx_floor(out_h), sy_floor(out_h);
-    std::vector<float> sdx(out_h), sdy(out_h);
-    std::vector<int> x0s(out_h), x1s(out_h), y0s(out_h), y1s(out_h);
-
-    for (int oh = 0; oh < out_h; ++oh) {
-        float sy = (out_h > 1) ? ((float)oh / (out_h - 1)) * (in_h - 1) : 0.0f;
-        int y0 = (int)std::floor(sy);
-        int y1 = std::min(y0 + 1, in_h - 1);
-        y0 = std::max(0, y0);
-        sy_floor[oh] = y0; y1s[oh] = y1; sdy[oh] = sy - y0;
-    }
-
-#pragma omp parallel for collapse(2) schedule(static)
-    for (int oh = 0; oh < out_h; ++oh) {
-        for (int ow = 0; ow < out_w; ++ow) {
-            float sx = (out_w > 1) ? ((float)ow / (out_w - 1)) * (in_w - 1) : 0.0f;
-            int x0 = std::max(0, (int)std::floor(sx));
-            int x1 = std::min(x0 + 1, in_w - 1);
-            float dx = sx - x0;
-
-            int y0 = sy_floor[oh], y1 = y1s[oh];
-            float dy = sdy[oh];
-
-            for (int ch = 0; ch < c; ++ch) {
-                size_t ci00 = (size_t)x0 + (size_t)y0 * in_w + (size_t)ch * in_w * in_h;
-                size_t ci10 = (size_t)x1 + (size_t)y0 * in_w + (size_t)ch * in_w * in_h;
-                size_t ci01 = (size_t)x0 + (size_t)y1 * in_w + (size_t)ch * in_w * in_h;
-                size_t ci11 = (size_t)x1 + (size_t)y1 * in_w + (size_t)ch * in_w * in_h;
-                float val = input[ci00]*(1-dx)*(1-dy) + input[ci10]*dx*(1-dy) +
-                            input[ci01]*(1-dx)*dy + input[ci11]*dx*dy;
-                output[ow + (size_t)oh * out_w + (size_t)ch * out_w * out_h] = val;
-            }
-        }
-    }
 }
 
 ggml_tensor* layer_norm(ggml_context* ctx, ggml_tensor* x,
@@ -267,22 +144,11 @@ ggml_tensor* layer_scale(ggml_context* ctx, ggml_tensor* x, ggml_tensor* gamma) 
 }
 
 ggml_tensor* conv_transpose2d(ggml_context* ctx, ggml_tensor* x,
-                                const ModelLoader& ml, const char* w_name, const char* b_name,
-                                int kernel_h, int kernel_w,
-                                int stride_h, int stride_w) {
-    // GGUF stores ConvTranspose2d weight in ggml order: [kw, kh, cout, cin]
-    // ggml_conv_transpose_2d_p0 expects: [kw, kh, cout, cin] ← matches!
-    ggml_tensor* src = ml.tensor(w_name);
-    assert(src && "conv_transpose2d weight not found");
-
-    int64_t ggml_ne[4] = {src->ne[0], src->ne[1], src->ne[2], src->ne[3]};
-
-    // Use cached transposed weight (no actual transpose needed, just passthrough)
-    std::vector<float>& wdata = get_transposed_conv2d_weight(ml, w_name, ggml_ne);
-
-    ggml_tensor* W = graph_input_tensor(ctx, GGML_TYPE_F32, 4, ggml_ne,
-        wdata.data(), wdata.size() * sizeof(float));
-
+                               const ModelLoader& ml, const char* w_name, const char* b_name,
+                               int kernel_h, int kernel_w,
+                               int stride_h, int stride_w) {
+    // Use GPU-resident weight tensor directly.
+    ggml_tensor* W = clone_weight(ctx, ml, w_name);
     int stride = stride_w;
     ggml_tensor* y = ggml_conv_transpose_2d_p0(ctx, W, x, stride);
 

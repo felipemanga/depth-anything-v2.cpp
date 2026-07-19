@@ -139,75 +139,6 @@ static ggml_tensor* vit_block(ggml_context* ctx, ggml_tensor* x,
     return x;
 }
 
-// Build entire ViT encoder in one pass, capturing intermediate block outputs.
-// The build lambda calls capture_graph_output() for all but the last intermediate,
-// and returns the last intermediate as the main output.
-static ggml_tensor* build_vit_all_blocks(ggml_context* ctx,
-    const ModelLoader& ml, const DAConfig& cfg,
-    int num_patches, int embed,
-    const std::vector<float>& ggml_input,
-    const std::vector<float>& cls_pos_data,
-    const std::vector<float>& patch_pos_data,
-    int input_w, int input_h,
-    const std::vector<int32_t>& inter_layers,
-    std::vector<std::vector<float>*> & captureDsts) {
-
-    // Patch embedding
-    ggml_tensor* x_img = graph_input_tensor(ctx, GGML_TYPE_F32, 4,
-        (int64_t[]){input_w, input_h, 3, 1},
-        ggml_input.data(), ggml_input.size() * sizeof(float));
-
-    ggml_tensor* patches = conv2d(ctx, x_img, ml,
-        "pretrained.patch_embed.proj.weight", "pretrained.patch_embed.proj.bias",
-        (int)cfg.patch_size, (int)cfg.patch_size,
-        (int)cfg.patch_size, (int)cfg.patch_size, 0, 0);
-
-    ggml_tensor* patches_flat = ggml_reshape_2d(ctx, patches, (int64_t)num_patches, embed);
-
-    // Positional embeddings
-    ggml_tensor* cls_pos_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, embed);
-    add_graph_input(cls_pos_input, cls_pos_data.data(), cls_pos_data.size() * sizeof(float));
-    ggml_tensor* patch_pos_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t)num_patches, embed);
-    add_graph_input(patch_pos_input, patch_pos_data.data(), patch_pos_data.size() * sizeof(float));
-
-    // CLS + patches
-    ggml_tensor* cls_token = clone_weight(ctx, ml, "pretrained.cls_token");
-    cls_token = ggml_reshape_2d(ctx, cls_token, 1, embed);
-    ggml_tensor* cls_with_pos = ggml_add(ctx, cls_token, cls_pos_input);
-    ggml_tensor* patches_with_pos = ggml_add(ctx, patches_flat, patch_pos_input);
-    ggml_tensor* x = ggml_concat(ctx, cls_with_pos, patches_with_pos, 0);
-
-    // Final encoder norm weights (shared across all intermediate captures)
-    ggml_tensor* fnorm_w = clone_weight(ctx, ml, "pretrained.norm.weight");
-    ggml_tensor* fnorm_b = clone_weight(ctx, ml, "pretrained.norm.bias");
-
-    int n_inter = (int)inter_layers.size();
-    ggml_tensor* lastIntermediate = nullptr;
-
-    // Run ALL transformer blocks, capturing intermediates as we go
-    for (int i = 0; i < (int)cfg.depth; ++i) {
-        x = vit_block(ctx, x, ml, i, cfg);
-
-        // Check if this block index is in our intermediate layers list
-        for (int ci = 0; ci < n_inter; ++ci) {
-            if (i == inter_layers[ci]) {
-                // Apply final encoder norm and capture
-                ggml_tensor* normed = layer_norm(ctx, x, fnorm_w, fnorm_b);
-                if (ci < n_inter - 1) {
-                    // Capture all but the last intermediate
-                    capture_graph_output(normed, captureDsts[ci]);
-                } else {
-                    // Last intermediate is the main output
-                    lastIntermediate = normed;
-                }
-                break;
-            }
-        }
-    }
-
-    return lastIntermediate;
-}
-
 std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input, int n_threads) {
     const DAConfig& cfg = ml.config();
 
@@ -292,49 +223,15 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
 
     perf_log("cpu_prep (CHW+pos_embed)");
 
-    // === CAPTURE INTERMEDIATE FEATURES (single-pass) ===
-    // Run ViT encoder once, capturing all intermediate block outputs simultaneously
-    const std::vector<int32_t>& inter_layers = cfg.intermediate_layers;
-    int n_inter = (int)inter_layers.size();
-
-    std::vector<std::vector<float>> inter_features(n_inter);
-    std::vector<std::vector<float>*> captureDsts(n_inter);
-    for (int i = 0; i < n_inter; ++i) captureDsts[i] = &inter_features[i];
-
-    bool vitOk = da::run_graph(0, n_threads, [&](ggml_context* ctx) -> ggml_tensor* {
-        return build_vit_all_blocks(ctx, ml, cfg,
-            num_patches, embed, ggml_input, cls_pos_data, patch_pos_data,
-            input.w, input.h, inter_layers, captureDsts);
-    }, inter_features[n_inter - 1]);
-
-    if (!vitOk) {
-        DA_LOG("predict: ViT encoder (single-pass) failed");
-        return {};
-    }
-    DA_LOG("predict: ViT single-pass captured %d intermediates", n_inter);
-
-    perf_log("vit_single_pass");
-
-    // Extract patch tokens (skip cls at row 0) from all intermediates
-    for (int i = 0; i < n_inter; ++i) {
-        std::vector<float> patchTokens((size_t)num_patches * embed);
-        const auto& vitOut = inter_features[i];
-        for (int p = 0; p < num_patches; ++p) {
-            for (int d = 0; d < embed; ++d) {
-                patchTokens[p + d * num_patches] = vitOut[(p + 1) + d * (num_patches + 1)];
-            }
-        }
-        inter_features[i] = std::move(patchTokens);
-    }
-
-    perf_log("patch_token_extraction");
-
-    // === DPT HEAD + REFINET + OUTPUT (single merged GPU graph) ===
-    // All 4 layer features stay on GPU — no intermediate CPU round-trips.
+    // === FULL PIPELINE: ViT + DPT + Refinet + Output (single merged GPU graph) ===
+    // All intermediate tensors stay on GPU — zero CPU round-trips.
+    // cls token is skipped via ggml_view (offset by 1 row, zero-copy).
     int head_feat = (int)cfg.head_features;
     int head_feat_half = head_feat / 2;
 
     // Resize layer output sizes
+    const std::vector<int32_t>& inter_layers = cfg.intermediate_layers;
+    int n_inter = (int)inter_layers.size();
     std::vector<int> resized_h(n_inter), resized_w(n_inter);
     resized_h[0] = p_h * 4; resized_w[0] = p_w * 4;
     resized_h[1] = p_h * 2; resized_w[1] = p_w * 2;
@@ -346,19 +243,62 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
 
     std::vector<float> depth_full;
     bool ok = da::run_graph(0, n_threads, [&](ggml_context* ctx) -> ggml_tensor* {
+        // === ViT ENCODER ===
+        ggml_tensor* x_img = graph_input_tensor(ctx, GGML_TYPE_F32, 4,
+            (int64_t[]){input.w, input.h, 3, 1},
+            ggml_input.data(), ggml_input.size() * sizeof(float));
+
+        ggml_tensor* patches = conv2d(ctx, x_img, ml,
+            "pretrained.patch_embed.proj.weight", "pretrained.patch_embed.proj.bias",
+            (int)cfg.patch_size, (int)cfg.patch_size,
+            (int)cfg.patch_size, (int)cfg.patch_size, 0, 0);
+        ggml_tensor* patches_flat = ggml_reshape_2d(ctx, patches, (int64_t)num_patches, embed);
+
+        ggml_tensor* cls_pos_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, embed);
+        add_graph_input(cls_pos_input, cls_pos_data.data(), cls_pos_data.size() * sizeof(float));
+        ggml_tensor* patch_pos_input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t)num_patches, embed);
+        add_graph_input(patch_pos_input, patch_pos_data.data(), patch_pos_data.size() * sizeof(float));
+
+        ggml_tensor* cls_token = clone_weight(ctx, ml, "pretrained.cls_token");
+        cls_token = ggml_reshape_2d(ctx, cls_token, 1, embed);
+        ggml_tensor* cls_with_pos = ggml_add(ctx, cls_token, cls_pos_input);
+        ggml_tensor* patches_with_pos = ggml_add(ctx, patches_flat, patch_pos_input);
+        ggml_tensor* x = ggml_concat(ctx, cls_with_pos, patches_with_pos, 0);
+
+        ggml_tensor* fnorm_w = clone_weight(ctx, ml, "pretrained.norm.weight");
+        ggml_tensor* fnorm_b = clone_weight(ctx, ml, "pretrained.norm.bias");
+
+        // Run all blocks, capture 4 intermediates as GPU tensors (cls skipped via view)
+        ggml_tensor* inter_patch[4];  // patch-only tensors, cls skipped
+        int inter_idx = 0;
+
+        for (int i = 0; i < (int)cfg.depth; ++i) {
+            x = vit_block(ctx, x, ml, i, cfg);
+
+            for (int ci = 0; ci < n_inter; ++ci) {
+                if (i == inter_layers[ci]) {
+                    ggml_tensor* normed = layer_norm(ctx, x, fnorm_w, fnorm_b);
+                    // Skip cls token (row 0) via view: offset by embed bytes, shape [num_patches, embed]
+                    // normed shape: [seq, embed] = [num_patches+1, embed]
+                    // Skip cls token (seq index 0) via view, then make contiguous for reshape.
+                    ggml_tensor* patch_view = ggml_view_2d(ctx, normed, (int64_t)num_patches, normed->ne[1],
+                        normed->nb[1], normed->nb[0]);
+                    inter_patch[ci] = ggml_cont(ctx, patch_view);
+                    inter_idx++;
+                    break;
+                }
+            }
+        }
+
         // === DPT HEAD: project + resize + layer_rn for all 4 features ===
         ggml_tensor* layer_rn[4];
         for (int i = 0; i < n_inter; ++i) {
-            ggml_tensor* feat = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t)num_patches, embed);
-            add_graph_input(feat, inter_features[i].data(), inter_features[i].size() * sizeof(float));
-            feat = ggml_reshape_4d(ctx, feat, (int64_t)p_w, (int64_t)p_h, embed, 1);
+            ggml_tensor* feat = ggml_reshape_4d(ctx, inter_patch[i], (int64_t)p_w, (int64_t)p_h, embed, 1);
 
-            // Project: conv2d 1x1
             std::string proj_w = "depth_head.projects." + std::to_string(i) + ".weight";
             std::string proj_b = "depth_head.projects." + std::to_string(i) + ".bias";
             feat = conv2d(ctx, feat, ml, proj_w.c_str(), proj_b.c_str(), 1, 1, 1, 1, 0, 0);
 
-            // Resize
             if (i == 0) {
                 feat = conv_transpose2d(ctx, feat, ml,
                     "depth_head.resize_layers.0.weight", "depth_head.resize_layers.0.bias",
@@ -375,93 +315,78 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
                     3, 3, 2, 2, 1, 1);
             }
 
-            // layer_rn
             std::string lrn_w = "depth_head.scratch.layer" + std::to_string(i+1) + "_rn.weight";
             feat = conv2d(ctx, feat, ml, lrn_w.c_str(), nullptr, 3, 3, 1, 1, 1, 1);
             layer_rn[i] = feat;
         }
 
         // === REFINET BLOCKS ===
-        // refinenet4: resConfUnit2 -> interp -> out_conv
-        ggml_tensor* x = layer_rn[3];
-        x = residual_conv_unit(ctx, x, ml,
+        ggml_tensor* rn = layer_rn[3];
+        rn = residual_conv_unit(ctx, rn, ml,
             "depth_head.scratch.refinenet4.resConfUnit2.conv1.weight",
             "depth_head.scratch.refinenet4.resConfUnit2.conv1.bias",
             "depth_head.scratch.refinenet4.resConfUnit2.conv2.weight",
             "depth_head.scratch.refinenet4.resConfUnit2.conv2.bias");
-        x = ggml_interpolate(ctx, x, resized_w[2], resized_h[2], head_feat, 1, bilinear_corners);
-        x = conv2d(ctx, x, ml,
+        rn = ggml_interpolate(ctx, rn, resized_w[2], resized_h[2], head_feat, 1, bilinear_corners);
+        rn = conv2d(ctx, rn, ml,
             "depth_head.scratch.refinenet4.out_conv.weight",
             "depth_head.scratch.refinenet4.out_conv.bias",
             1, 1, 1, 1, 0, 0);
 
-        // refinenet3, refinenet2, refinenet1
-        for (int rn = 3; rn >= 1; --rn) {
-            int skip_idx = rn - 1;
+        for (int stage = 3; stage >= 1; --stage) {
+            int skip_idx = stage - 1;
             ggml_tensor* skip = layer_rn[skip_idx];
-
-            std::string prefix = "depth_head.scratch.refinenet" + std::to_string(rn) + ".";
+            std::string prefix = "depth_head.scratch.refinenet" + std::to_string(stage) + ".";
             ggml_tensor* res = residual_conv_unit(ctx, skip, ml,
                 (prefix + "resConfUnit1.conv1.weight").c_str(),
                 (prefix + "resConfUnit1.conv1.bias").c_str(),
                 (prefix + "resConfUnit1.conv2.weight").c_str(),
                 (prefix + "resConfUnit1.conv2.bias").c_str());
-            x = ggml_add(ctx, x, res);
-            x = residual_conv_unit(ctx, x, ml,
+            rn = ggml_add(ctx, rn, res);
+            rn = residual_conv_unit(ctx, rn, ml,
                 (prefix + "resConfUnit2.conv1.weight").c_str(),
                 (prefix + "resConfUnit2.conv1.bias").c_str(),
                 (prefix + "resConfUnit2.conv2.weight").c_str(),
                 (prefix + "resConfUnit2.conv2.bias").c_str());
 
-            int out_h = (rn > 1) ? resized_h[rn - 2] : resized_h[0] * 2;
-            int out_w = (rn > 1) ? resized_w[rn - 2] : resized_w[0] * 2;
-            x = ggml_interpolate(ctx, x, out_w, out_h, head_feat, 1, bilinear_corners);
-            x = conv2d(ctx, x, ml,
+            int out_h = (stage > 1) ? resized_h[stage - 2] : resized_h[0] * 2;
+            int out_w = (stage > 1) ? resized_w[stage - 2] : resized_w[0] * 2;
+            rn = ggml_interpolate(ctx, rn, out_w, out_h, head_feat, 1, bilinear_corners);
+            rn = conv2d(ctx, rn, ml,
                 (prefix + "out_conv.weight").c_str(),
                 (prefix + "out_conv.bias").c_str(),
                 1, 1, 1, 1, 0, 0);
         }
 
         // === OUTPUT CONVS + FINAL RESIZE ===
-        x = conv2d(ctx, x, ml,
+        rn = conv2d(ctx, rn, ml,
             "depth_head.scratch.output_conv1.weight",
             "depth_head.scratch.output_conv1.bias",
             3, 3, 1, 1, 1, 1);
 
         int pre_up_h = resized_h[0] * 2;
         int pre_up_w = resized_w[0] * 2;
-        x = ggml_interpolate(ctx, x, pre_up_w * 2, pre_up_h * 2, head_feat_half, 1, bilinear_corners);
+        rn = ggml_interpolate(ctx, rn, pre_up_w * 2, pre_up_h * 2, head_feat_half, 1, bilinear_corners);
 
-        x = conv2d(ctx, x, ml,
+        rn = conv2d(ctx, rn, ml,
             "depth_head.scratch.output_conv2.0.weight",
             "depth_head.scratch.output_conv2.0.bias",
             3, 3, 1, 1, 1, 1);
-        x = ggml_relu(ctx, x);
-        x = conv2d(ctx, x, ml,
+        rn = ggml_relu(ctx, rn);
+        rn = conv2d(ctx, rn, ml,
             "depth_head.scratch.output_conv2.2.weight",
             "depth_head.scratch.output_conv2.2.bias",
             1, 1, 1, 1, 0, 0);
-        x = ggml_relu(ctx, x);
+        rn = ggml_relu(ctx, rn);
 
-        x = ggml_interpolate(ctx, x, input.orig_w, input.orig_h, 1, 1, bilinear_corners);
-        return ggml_reshape_1d(ctx, x, (int64_t)input.orig_w * input.orig_h);
+        rn = ggml_interpolate(ctx, rn, input.orig_w, input.orig_h, 1, 1, bilinear_corners);
+        return ggml_reshape_1d(ctx, rn, (int64_t)input.orig_w * input.orig_h);
     }, depth_full);
 
-    if (!ok) { DA_LOG("predict: dpt+refinet+output GPU failed"); return {}; }
+    if (!ok) { DA_LOG("predict: full pipeline GPU failed"); return {}; }
 
-    perf_log("dpt+refinet+output (GPU)");
+    perf_log("full_pipeline (GPU)");
     return depth_full;
-}
-
-std::vector<float> postprocess_depth(const std::vector<float>& depth,
-                                       int32_t depth_h, int32_t depth_w,
-                                       int32_t target_h, int32_t target_w) {
-    if (depth_h == target_h && depth_w == target_w) return depth;
-    std::vector<float> result((size_t)target_w * target_h);
-    // Python uses align_corners=True for final depth upscale (dpt.py:192)
-    bilinear_upscale_host_corners(depth.data(), result.data(),
-        depth_w, depth_h, 1, 1, target_w, target_h);
-    return result;
 }
 
 std::vector<uint16_t> depth_to_uint16(const std::vector<float>& depth) {

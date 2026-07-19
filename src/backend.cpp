@@ -253,12 +253,6 @@ ggml_tensor* graph_input_tensor(ggml_context* ctx, int type, int n_dims,
     return t;
 }
 
-void capture_graph_output(ggml_tensor* t, std::vector<float>* dst) {
-    GGML_ASSERT(t_active != nullptr &&
-                "capture_graph_output called outside a Backend::compute build lambda");
-    t_active->register_capture(t, dst);
-}
-
 void ensure_weights_realized(const ModelLoader& ml) {
     if (ml.weights_realized()) return;
     ModelLoader& mut = const_cast<ModelLoader&>(ml);

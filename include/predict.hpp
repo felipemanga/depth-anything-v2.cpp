@@ -27,11 +27,6 @@ PreprocessedImage preprocess(const Image& img, uint32_t target_size, uint32_t pa
 // Depth values are raw (not normalized to 0-255).
 std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input, int n_threads);
 
-// Post-process: bilinear upscale depth map to original image size.
-std::vector<float> postprocess_depth(const std::vector<float>& depth,
-                                     int32_t depth_h, int32_t depth_w,
-                                     int32_t target_h, int32_t target_w);
-
 // Convert raw depth to 16-bit uint.
 std::vector<uint16_t> depth_to_uint16(const std::vector<float>& depth);
 
