@@ -241,9 +241,8 @@ ggml_tensor* self_attention(ggml_context* ctx, ggml_tensor* x,
     float scale = 1.0f / std::sqrt((float)head_dim);
     ggml_tensor* out_h = ggml_flash_attn_ext(ctx, q_h, k_h, v_h, nullptr, scale, 0.0f, 0.0f);
 
-    // Merge heads: [head_dim, heads, seq] -> [head_dim, seq, heads] -> [embed, seq] -> [seq, embed]
-    ggml_tensor* merged = ggml_cont(ctx, ggml_permute(ctx, out_h, 0, 2, 1, 3));
-    ggml_tensor* out = ggml_reshape_2d(ctx, merged, embed_dim, seq_len);
+    // out_h: [head_dim, heads, seq] -> reshape to [embed, seq] -> transpose to [seq, embed]
+    ggml_tensor* out = ggml_reshape_2d(ctx, out_h, embed_dim, seq_len);
     out = ggml_cont(ctx, ggml_transpose(ctx, out));
 
     out = linear(ctx, out, ml, proj_w_name, proj_b_name);
