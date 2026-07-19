@@ -329,7 +329,8 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
 
     perf_log("patch_token_extraction");
 
-    // === DPT HEAD ===
+    // === DPT HEAD + REFINET + OUTPUT (single merged GPU graph) ===
+    // All 4 layer features stay on GPU — no intermediate CPU round-trips.
     int head_feat = (int)cfg.head_features;
     int head_feat_half = head_feat / 2;
 
@@ -341,86 +342,54 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
     resized_h[3] = (p_h - 1) / 2 + 1;
     resized_w[3] = (p_w - 1) / 2 + 1;
 
-    // Project + resize + layer_rn for ALL features in ONE GPU graph
-    std::vector<std::vector<float>> layer_rn_data(n_inter);
-    std::vector<std::pair<int, int>> layer_rn_sizes(n_inter);
-    for (int i = 0; i < n_inter; ++i) layer_rn_sizes[i] = {resized_h[i], resized_w[i]};
-
-    {
-        bool ok = da::run_graph(0, n_threads, [&](ggml_context* ctx) -> ggml_tensor* {
-            ggml_tensor* last = nullptr;
-            for (int i = 0; i < n_inter; ++i) {
-                ggml_tensor* feat = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t)num_patches, embed);
-                add_graph_input(feat, inter_features[i].data(), inter_features[i].size() * sizeof(float));
-                feat = ggml_reshape_4d(ctx, feat, (int64_t)p_w, (int64_t)p_h, embed, 1);
-
-                // Project: conv2d 1x1
-                std::string proj_w = "depth_head.projects." + std::to_string(i) + ".weight";
-                std::string proj_b = "depth_head.projects." + std::to_string(i) + ".bias";
-                feat = conv2d(ctx, feat, ml, proj_w.c_str(), proj_b.c_str(), 1, 1, 1, 1, 0, 0);
-
-                // Resize
-                if (i == 0) {
-                    feat = conv_transpose2d(ctx, feat, ml,
-                        "depth_head.resize_layers.0.weight", "depth_head.resize_layers.0.bias",
-                        4, 4, 4, 4);
-                } else if (i == 1) {
-                    feat = conv_transpose2d(ctx, feat, ml,
-                        "depth_head.resize_layers.1.weight", "depth_head.resize_layers.1.bias",
-                        2, 2, 2, 2);
-                } else if (i == 2) {
-                    // Identity
-                } else if (i == 3) {
-                    feat = conv2d(ctx, feat, ml,
-                        "depth_head.resize_layers.3.weight", "depth_head.resize_layers.3.bias",
-                        3, 3, 2, 2, 1, 1);
-                }
-
-                // layer_rn
-                std::string lrn_w = "depth_head.scratch.layer" + std::to_string(i+1) + "_rn.weight";
-                feat = conv2d(ctx, feat, ml, lrn_w.c_str(), nullptr, 3, 3, 1, 1, 1, 1);
-
-                int fh = resized_h[i], fw = resized_w[i];
-                feat = ggml_reshape_1d(ctx, feat, (int64_t)fw * fh * head_feat);
-
-                // Capture first 3, return the last as main output
-                if (i < n_inter - 1) {
-                    capture_graph_output(feat, &layer_rn_data[i]);
-                } else {
-                    last = feat;
-                }
-            }
-            return last;
-        }, layer_rn_data[n_inter - 1]);
-
-        if (!ok) {
-            DA_LOG("predict: DPT head merged failed");
-            return {};
-        }
-    }
-
-    perf_log("dpt_head");
-
-    // === REFINET + OUTPUT (single merged GPU graph) ===
-    // All refinenet blocks, output convs, and final resize in one graph.
-    // Uses ggml_interpolate for bilinear upscale (GPU, no contiguity issues).
-
     uint32_t bilinear_corners = GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS;
 
     std::vector<float> depth_full;
     bool ok = da::run_graph(0, n_threads, [&](ggml_context* ctx) -> ggml_tensor* {
+        // === DPT HEAD: project + resize + layer_rn for all 4 features ===
+        ggml_tensor* layer_rn[4];
+        for (int i = 0; i < n_inter; ++i) {
+            ggml_tensor* feat = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (int64_t)num_patches, embed);
+            add_graph_input(feat, inter_features[i].data(), inter_features[i].size() * sizeof(float));
+            feat = ggml_reshape_4d(ctx, feat, (int64_t)p_w, (int64_t)p_h, embed, 1);
+
+            // Project: conv2d 1x1
+            std::string proj_w = "depth_head.projects." + std::to_string(i) + ".weight";
+            std::string proj_b = "depth_head.projects." + std::to_string(i) + ".bias";
+            feat = conv2d(ctx, feat, ml, proj_w.c_str(), proj_b.c_str(), 1, 1, 1, 1, 0, 0);
+
+            // Resize
+            if (i == 0) {
+                feat = conv_transpose2d(ctx, feat, ml,
+                    "depth_head.resize_layers.0.weight", "depth_head.resize_layers.0.bias",
+                    4, 4, 4, 4);
+            } else if (i == 1) {
+                feat = conv_transpose2d(ctx, feat, ml,
+                    "depth_head.resize_layers.1.weight", "depth_head.resize_layers.1.bias",
+                    2, 2, 2, 2);
+            } else if (i == 2) {
+                // Identity
+            } else if (i == 3) {
+                feat = conv2d(ctx, feat, ml,
+                    "depth_head.resize_layers.3.weight", "depth_head.resize_layers.3.bias",
+                    3, 3, 2, 2, 1, 1);
+            }
+
+            // layer_rn
+            std::string lrn_w = "depth_head.scratch.layer" + std::to_string(i+1) + "_rn.weight";
+            feat = conv2d(ctx, feat, ml, lrn_w.c_str(), nullptr, 3, 3, 1, 1, 1, 1);
+            layer_rn[i] = feat;
+        }
+
+        // === REFINET BLOCKS ===
         // refinenet4: resConfUnit2 -> interp -> out_conv
-        ggml_tensor* x = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
-            layer_rn_sizes[3].second, layer_rn_sizes[3].first, head_feat, 1);
-        add_graph_input(x, layer_rn_data[3].data(), layer_rn_data[3].size() * sizeof(float));
+        ggml_tensor* x = layer_rn[3];
         x = residual_conv_unit(ctx, x, ml,
             "depth_head.scratch.refinenet4.resConfUnit2.conv1.weight",
             "depth_head.scratch.refinenet4.resConfUnit2.conv1.bias",
             "depth_head.scratch.refinenet4.resConfUnit2.conv2.weight",
             "depth_head.scratch.refinenet4.resConfUnit2.conv2.bias");
-        x = ggml_interpolate(ctx, x,
-            layer_rn_sizes[2].second, layer_rn_sizes[2].first, head_feat, 1,
-            bilinear_corners);
+        x = ggml_interpolate(ctx, x, resized_w[2], resized_h[2], head_feat, 1, bilinear_corners);
         x = conv2d(ctx, x, ml,
             "depth_head.scratch.refinenet4.out_conv.weight",
             "depth_head.scratch.refinenet4.out_conv.bias",
@@ -429,10 +398,7 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
         // refinenet3, refinenet2, refinenet1
         for (int rn = 3; rn >= 1; --rn) {
             int skip_idx = rn - 1;
-            int skip_h = layer_rn_sizes[skip_idx].first;
-            int skip_w = layer_rn_sizes[skip_idx].second;
-            ggml_tensor* skip = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, skip_w, skip_h, head_feat, 1);
-            add_graph_input(skip, layer_rn_data[skip_idx].data(), layer_rn_data[skip_idx].size() * sizeof(float));
+            ggml_tensor* skip = layer_rn[skip_idx];
 
             std::string prefix = "depth_head.scratch.refinenet" + std::to_string(rn) + ".";
             ggml_tensor* res = residual_conv_unit(ctx, skip, ml,
@@ -447,9 +413,8 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
                 (prefix + "resConfUnit2.conv2.weight").c_str(),
                 (prefix + "resConfUnit2.conv2.bias").c_str());
 
-            // Upscale: to next skip size, or 2x for last stage
-            int out_h = (rn > 1) ? layer_rn_sizes[rn - 2].first : layer_rn_sizes[0].first * 2;
-            int out_w = (rn > 1) ? layer_rn_sizes[rn - 2].second : layer_rn_sizes[0].second * 2;
+            int out_h = (rn > 1) ? resized_h[rn - 2] : resized_h[0] * 2;
+            int out_w = (rn > 1) ? resized_w[rn - 2] : resized_w[0] * 2;
             x = ggml_interpolate(ctx, x, out_w, out_h, head_feat, 1, bilinear_corners);
             x = conv2d(ctx, x, ml,
                 (prefix + "out_conv.weight").c_str(),
@@ -457,15 +422,14 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
                 1, 1, 1, 1, 0, 0);
         }
 
-        // output_conv1 -> 4x bilinear upscale -> output_conv2 -> final resize to original
+        // === OUTPUT CONVS + FINAL RESIZE ===
         x = conv2d(ctx, x, ml,
             "depth_head.scratch.output_conv1.weight",
             "depth_head.scratch.output_conv1.bias",
             3, 3, 1, 1, 1, 1);
 
-        // 4x bilinear upscale via two ggml_interpolate passes
-        int pre_up_h = layer_rn_sizes[0].first * 2;
-        int pre_up_w = layer_rn_sizes[0].second * 2;
+        int pre_up_h = resized_h[0] * 2;
+        int pre_up_w = resized_w[0] * 2;
         x = ggml_interpolate(ctx, x, pre_up_w * 2, pre_up_h * 2, head_feat_half, 1, bilinear_corners);
 
         x = conv2d(ctx, x, ml,
@@ -479,14 +443,13 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
             1, 1, 1, 1, 0, 0);
         x = ggml_relu(ctx, x);
 
-        // Final resize to original image size
         x = ggml_interpolate(ctx, x, input.orig_w, input.orig_h, 1, 1, bilinear_corners);
         return ggml_reshape_1d(ctx, x, (int64_t)input.orig_w * input.orig_h);
     }, depth_full);
 
-    if (!ok) { DA_LOG("predict: refinenet+output GPU failed"); return {}; }
+    if (!ok) { DA_LOG("predict: dpt+refinet+output GPU failed"); return {}; }
 
-    perf_log("refinet+output (GPU)");
+    perf_log("dpt+refinet+output (GPU)");
     return depth_full;
 }
 
