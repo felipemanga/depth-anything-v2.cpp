@@ -160,6 +160,7 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
     }
 
     // Pre-compute positional embeddings on host
+    ensure_weights_realized(ml);
     ggml_tensor* pos_embed_raw = ml.tensor("pretrained.pos_embed");
     int N_train = (int)pos_embed_raw->ne[1];
     int sqrt_N = (int)std::round(std::sqrt((float)(N_train - 1)));
@@ -221,7 +222,7 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
         }
     }
 
-    perf_log("cpu_prep (CHW+pos_embed)");
+    // perf_log("cpu_prep (CHW+pos_embed)");
 
     // === FULL PIPELINE: ViT + DPT + Refinet + Output (single merged GPU graph) ===
     // All intermediate tensors stay on GPU — zero CPU round-trips.
@@ -385,7 +386,7 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
 
     if (!ok) { DA_LOG("predict: full pipeline GPU failed"); return {}; }
 
-    perf_log("full_pipeline (GPU)");
+    // perf_log("full_pipeline (GPU)");
     return depth_full;
 }
 

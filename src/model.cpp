@@ -68,13 +68,14 @@ bool ModelLoader::realize_weights(ggml_backend_t backend){
         weights_buf_ = ggml_backend_cpu_buffer_from_ptr(base, size);
         if(!weights_buf_){ DA_LOG("realize_weights: buffer_from_ptr failed"); return false; }
         for(auto& kv : tensors_) kv.second->buffer = weights_buf_;
+        weights_realized_ = true;
         return true;
     }
 
     // Device path
     const size_t n = tensors_.size();
     struct ggml_init_params dp = {
-        /*.mem_size  =*/ ggml_tensor_overhead() * (n + 8),
+        /*.mem_size  =*/ ggml_tensor_overhead() * (n + 256),
         /*.mem_buffer=*/ nullptr,
         /*.no_alloc  =*/ true,
     };
@@ -95,6 +96,7 @@ bool ModelLoader::realize_weights(ggml_backend_t backend){
     for (auto& pr : ups)
         ggml_backend_tensor_set(pr.first, pr.second, 0, ggml_nbytes(pr.first));
     tensors_.swap(devmap);
+    weights_realized_ = true;
     return true;
 }
 

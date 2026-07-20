@@ -14,13 +14,14 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
 namespace da {
 
 namespace {
-constexpr size_t kGraphSize = 16384;
+constexpr size_t kGraphSize = 32768;
 
 struct PendingInput {
     ggml_tensor* tensor;
@@ -254,6 +255,9 @@ ggml_tensor* graph_input_tensor(ggml_context* ctx, int type, int n_dims,
 }
 
 void ensure_weights_realized(const ModelLoader& ml) {
+    if (ml.weights_realized()) return;
+    static std::mutex init_mutex;
+    std::lock_guard<std::mutex> lock(init_mutex);
     if (ml.weights_realized()) return;
     ModelLoader& mut = const_cast<ModelLoader&>(ml);
     mut.realize_weights(global_backend().handle());
