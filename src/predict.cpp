@@ -14,6 +14,10 @@
 #include <vector>
 #include <chrono>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 namespace da {
 
 static constexpr float IMAGENET_MEAN[3]  = {0.485f, 0.456f, 0.406f};
@@ -176,9 +180,27 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
     int num_patches = p_h * p_w;
     int embed = (int)cfg.embed_dim;
 
-    // Convert CHW -> WHC for ggml conv2d
+    // Convert CHW -> WHC for ggml conv2d (SIMD-accelerated)
     g_perf_start = std::chrono::steady_clock::now();
     std::vector<float> ggml_input((size_t)input.w * input.h * 3);
+#if defined(__x86_64__) || defined(_M_X64)
+    const int simd_n = (input.w / 4) * 4; // SSE: 4 floats per __m128
+    for (int c = 0; c < 3; ++c) {
+        const float* src_row = input.data.data() + c * (size_t)input.h * input.w;
+        float* dst_row = ggml_input.data() + c * (size_t)input.w * input.h;
+        for (int y = 0; y < input.h; ++y) {
+            for (int x = 0; x < simd_n; x += 4) {
+                _mm_storeu_ps(dst_row + x, _mm_loadu_ps(src_row + x));
+            }
+            // Scalar remainder
+            for (int x = simd_n; x < input.w; ++x) {
+                dst_row[x] = src_row[x];
+            }
+            src_row += input.w;
+            dst_row += input.w;
+        }
+    }
+#else
     for (int c = 0; c < 3; ++c) {
         for (int y = 0; y < input.h; ++y) {
             for (int x = 0; x < input.w; ++x) {
@@ -187,6 +209,7 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
             }
         }
     }
+#endif
 
     // Pre-compute positional embeddings on host
     ensure_weights_realized(ml);
@@ -420,19 +443,60 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
 }
 
 std::vector<uint16_t> depth_to_uint16(const std::vector<float>& depth) {
+#if defined(__x86_64__) || defined(_M_X64)
+    // SIMD min/max reduction
+    __m128 v_min = _mm_set1_ps(depth[0]);
+    __m128 v_max = _mm_set1_ps(depth[0]);
+    const size_t nvec = depth.size() / 4;
+    for (size_t i = 0; i < nvec; ++i) {
+        __m128 v = _mm_loadu_ps(depth.data() + i * 4);
+        v_min = _mm_min_ps(v_min, v);
+        v_max = _mm_max_ps(v_max, v);
+    }
+    // Horizontal min/max
+    __m128 t = _mm_min_ps(v_min, _mm_shuffle_ps(v_min, v_min, 0x4E));
+    v_min = _mm_min_ps(t, _mm_shuffle_ps(t, t, 0xB1));
+    t = _mm_max_ps(v_max, _mm_shuffle_ps(v_max, v_max, 0x4E));
+    v_max = _mm_max_ps(t, _mm_shuffle_ps(t, t, 0xB1));
+    float d_min = _mm_cvtss_f32(v_min);
+    float d_max = _mm_cvtss_f32(v_max);
+#else
     float d_min = depth[0], d_max = depth[0];
     for (float v : depth) {
         d_min = std::min(d_min, v);
         d_max = std::max(d_max, v);
     }
+#endif
     float range = d_max - d_min;
     if (range < 1e-6f) range = 1.0f;
 
     std::vector<uint16_t> result(depth.size());
-    for (size_t i = 0; i < depth.size(); ++i) {
-        float t = (depth[i] - d_min) / range;
-        result[i] = (uint16_t)(t * 65535.0f);
+    float scale = 65535.0f / range;
+    float off = -d_min / range;
+#if defined(__x86_64__) || defined(_M_X64)
+    __m128 v_scale = _mm_set1_ps(scale);
+    __m128 v_off = _mm_set1_ps(off);
+    size_t i = 0;
+    for (size_t iv = 0; iv < nvec; ++iv) {
+        __m128 v = _mm_loadu_ps(depth.data() + iv * 4);
+        v = _mm_add_ps(_mm_mul_ps(v, v_scale), v_off);
+        __m128i vi = _mm_cvtps_epi32(v);
+        uint32_t tmp[4];
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(tmp), vi);
+        result[i++] = static_cast<uint16_t>(tmp[0]);
+        result[i++] = static_cast<uint16_t>(tmp[1]);
+        result[i++] = static_cast<uint16_t>(tmp[2]);
+        result[i++] = static_cast<uint16_t>(tmp[3]);
     }
+    // Scalar remainder
+    for (size_t ri = nvec * 4; ri < depth.size(); ++ri) {
+        result[ri] = static_cast<uint16_t>(depth[ri] * scale + off);
+    }
+#else
+    for (size_t i = 0; i < depth.size(); ++i) {
+        result[i] = static_cast<uint16_t>(depth[i] * scale + off);
+    }
+#endif
     return result;
 }
 
