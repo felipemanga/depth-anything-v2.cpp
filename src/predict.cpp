@@ -231,7 +231,30 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
     bool need_interp = (p_h != sqrt_N || p_w != sqrt_N);
 
     if (need_interp) {
-        // Bicubic interpolate pos_embed
+        // Pre-compute bicubic weights & clamped indices
+        float x_r = (float)sqrt_N / (float)p_w;
+        float y_r = (float)sqrt_N / (float)p_h;
+        struct Tap { float w; int idx; };
+        std::vector<std::array<Tap, 4>> x_taps(p_w), y_taps(p_h);
+        for (int x = 0; x < p_w; ++x) {
+            float sx = (x + 0.5f) * x_r - 0.5f;
+            int x0 = (int)std::floor(sx);
+            float dx = sx - x0;
+            for (int i = -1; i <= 2; ++i) {
+                x_taps[x][i + 1] = { cubic_kernel(dx - i),
+                                      std::max(0, std::min(x0 + i, sqrt_N - 1)) };
+            }
+        }
+        for (int y = 0; y < p_h; ++y) {
+            float sy = (y + 0.5f) * y_r - 0.5f;
+            int y0 = (int)std::floor(sy);
+            float dy = sy - y0;
+            for (int j = -1; j <= 2; ++j) {
+                y_taps[y][j + 1] = { cubic_kernel(dy - j),
+                                      std::max(0, std::min(y0 + j, sqrt_N - 1)) };
+            }
+        }
+
         std::vector<float> grid_in((size_t)sqrt_N * sqrt_N);
         std::vector<float> grid_out((size_t)p_h * p_w);
         for (int d = 0; d < embed; ++d) {
@@ -240,23 +263,16 @@ std::vector<float> predict(const ModelLoader& ml, const PreprocessedImage& input
                     grid_in[y * sqrt_N + x] = pos_ptr[(y * sqrt_N + x + 1) * embed + d];
                 }
             }
-            // Bicubic
-            float x_r = (float)sqrt_N / (float)p_w;
-            float y_r = (float)sqrt_N / (float)p_h;
             for (int y = 0; y < p_h; ++y) {
+                const Tap* yt = &y_taps[y][0];
                 for (int x = 0; x < p_w; ++x) {
-                    float sx = (x + 0.5f) * x_r - 0.5f;
-                    float sy = (y + 0.5f) * y_r - 0.5f;
-                    int x0 = (int)std::floor(sx);
-                    int y0 = (int)std::floor(sy);
-                    float dx = sx - x0;
-                    float dy = sy - y0;
+                    const Tap* xt = &x_taps[x][0];
                     float val = 0.0f;
-                    for (int j = -1; j <= 2; ++j) {
-                        for (int i = -1; i <= 2; ++i) {
-                            int nx = std::max(0, std::min(x0 + i, sqrt_N - 1));
-                            int ny = std::max(0, std::min(y0 + j, sqrt_N - 1));
-                            val += grid_in[ny * sqrt_N + nx] * cubic_kernel(dx - i) * cubic_kernel(dy - j);
+                    for (int j = 0; j < 4; ++j) {
+                        float wy = yt[j].w;
+                        const float* r = grid_in.data() + yt[j].idx * sqrt_N;
+                        for (int i = 0; i < 4; ++i) {
+                            val += r[xt[i].idx] * xt[i].w * wy;
                         }
                     }
                     grid_out[y * p_w + x] = val;
