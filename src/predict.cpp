@@ -58,10 +58,8 @@ PreprocessedImage preprocess(const Image& img, uint32_t target_size, uint32_t pa
 
     float scale_h = (float)target_size / (float)img.h;
     float scale_w = (float)target_size / (float)img.w;
-    // keep_aspect_ratio=True: scale so larger dimension = target_size
     float scale = std::min(scale_h, scale_w);
 
-    // Python: constrain_to_multiple_of(scale * dim, patch_size) -- floor to multiple
     int new_h = constrain_to_multiple_of(scale * img.h, (int)patch_size);
     int new_w = constrain_to_multiple_of(scale * img.w, (int)patch_size);
 
@@ -69,36 +67,67 @@ PreprocessedImage preprocess(const Image& img, uint32_t target_size, uint32_t pa
     result.w = new_w;
     result.data.resize((size_t)3 * new_h * new_w);
 
-    float x_ratio = (float)img.w / (float)new_w;
-    float y_ratio = (float)img.h / (float)new_h;
+    const float x_ratio = (float)img.w / (float)new_w;
+    const float y_ratio = (float)img.h / (float)new_h;
+    const uint8_t* src = img.data.data();
+    float* dst = result.data.data();
+    const int src_w = img.w;
+    const int src_h = img.h;
+    const int dst_w = new_w;
+    const int dst_h = new_h;
 
-    // Bicubic interpolation for image resize (matches cv2.INTER_CUBIC)
-    for (int y = 0; y < new_h; ++y) {
-        for (int x = 0; x < new_w; ++x) {
+    // Pre-allocated buffers for bicubic taps (avoids allocation in hot loop)
+    alignas(16) float wx_buf[4];
+    alignas(16) float wy_buf[4];
+    alignas(16) int src_x[4];
+    alignas(16) int src_y[4];
+
+    // Process row-by-row — inspired by DeltaAI Blit row-pointer pattern
+    for (int y = 0; y < dst_h; ++y) {
+        // Pre-compute y weights & clamped source rows (4 bicubic taps)
+        float sy = (y + 0.5f) * y_ratio - 0.5f;
+        int y0 = (int)std::floor(sy);
+        for (int j = -1; j <= 2; ++j) {
+            wy_buf[j + 1] = cubic_kernel(sy - (y0 + j));
+            src_y[j + 1] = std::max(0, std::min(y0 + j, src_h - 1));
+        }
+
+        // Destination row pointers (CHW layout)
+        float* dst_r = dst + 0 * dst_h * dst_w + y * dst_w;
+        float* dst_g = dst + 1 * dst_h * dst_w + y * dst_w;
+        float* dst_b = dst + 2 * dst_h * dst_w + y * dst_w;
+
+        for (int x = 0; x < dst_w; ++x) {
+            // Pre-compute x weights & clamped source cols (4 bicubic taps)
             float sx = (x + 0.5f) * x_ratio - 0.5f;
-            float sy = (y + 0.5f) * y_ratio - 0.5f;
-
             int x0 = (int)std::floor(sx);
-            int y0 = (int)std::floor(sy);
+            for (int i = -1; i <= 2; ++i) {
+                wx_buf[i + 1] = cubic_kernel(sx - (x0 + i));
+                src_x[i + 1] = std::max(0, std::min(x0 + i, src_w - 1));
+            }
 
-            for (int c = 0; c < 3; ++c) {
-                float val = 0.0f;
-                float wsum = 0.0f;
-                // Bicubic: sample 4x4 neighborhood
-                for (int j = -1; j <= 2; ++j) {
-                    for (int i = -1; i <= 2; ++i) {
-                        int nx = std::max(0, std::min(x0 + i, img.w - 1));
-                        int ny = std::max(0, std::min(y0 + j, img.h - 1));
-                        float wx = cubic_kernel(sx - (x0 + i));
-                        float wy = cubic_kernel(sy - (y0 + j));
-                        float w = wx * wy;
-                        val += w * img.data[((size_t)ny * img.w + nx) * 3 + c] / 255.0f;
-                        wsum += w;
-                    }
+            // Accumulate RGB simultaneously across 4×4 bicubic neighborhood
+            float vr = 0.0f, vg = 0.0f, vb = 0.0f;
+            float wsum = 0.0f;
+
+            for (int j = 0; j < 4; ++j) {
+                float wy = wy_buf[j];
+                const uint8_t* src_row = src + (size_t)src_y[j] * src_w * 3;
+                for (int i = 0; i < 4; ++i) {
+                    float w = wx_buf[i] * wy;
+                    const uint8_t* px = src_row + src_x[i] * 3;
+                    vr += w * px[0];
+                    vg += w * px[1];
+                    vb += w * px[2];
+                    wsum += w;
                 }
-                if (wsum > 1e-8f) val /= wsum; // normalize weights
-                val = (val - IMAGENET_MEAN[c]) / IMAGENET_STD[c];
-                result.data[c * new_h * new_w + y * new_w + x] = val;
+            }
+
+            if (wsum > 1e-8f) {
+                float inv = 1.0f / wsum;
+                dst_r[x] = (vr * inv / 255.0f - IMAGENET_MEAN[0]) / IMAGENET_STD[0];
+                dst_g[x] = (vg * inv / 255.0f - IMAGENET_MEAN[1]) / IMAGENET_STD[1];
+                dst_b[x] = (vb * inv / 255.0f - IMAGENET_MEAN[2]) / IMAGENET_STD[2];
             }
         }
     }
