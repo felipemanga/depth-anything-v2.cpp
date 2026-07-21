@@ -488,14 +488,19 @@ std::vector<uint16_t> depth_to_uint16(const std::vector<float>& depth) {
 
     std::vector<uint16_t> result(depth.size());
     float scale = 65535.0f / range;
-    float off = -d_min / range;
+    float off = -d_min * scale;
 #if defined(__x86_64__) || defined(_M_X64)
     __m128 v_scale = _mm_set1_ps(scale);
     __m128 v_off = _mm_set1_ps(off);
+    __m128 v_zero = _mm_setzero_ps();
+    __m128 v_65535 = _mm_set1_ps(65535.0f);
     size_t i = 0;
     for (size_t iv = 0; iv < nvec; ++iv) {
         __m128 v = _mm_loadu_ps(depth.data() + iv * 4);
         v = _mm_add_ps(_mm_mul_ps(v, v_scale), v_off);
+        // Clamp to [0, 65535] to prevent overflow
+        v = _mm_max_ps(v, v_zero);
+        v = _mm_min_ps(v, v_65535);
         __m128i vi = _mm_cvtps_epi32(v);
         uint32_t tmp[4];
         _mm_storeu_si128(reinterpret_cast<__m128i*>(tmp), vi);
@@ -506,11 +511,15 @@ std::vector<uint16_t> depth_to_uint16(const std::vector<float>& depth) {
     }
     // Scalar remainder
     for (size_t ri = nvec * 4; ri < depth.size(); ++ri) {
-        result[ri] = static_cast<uint16_t>(depth[ri] * scale + off);
+        float val = depth[ri] * scale + off;
+        val = std::max(0.0f, std::min(65535.0f, val));
+        result[ri] = static_cast<uint16_t>(val);
     }
 #else
     for (size_t i = 0; i < depth.size(); ++i) {
-        result[i] = static_cast<uint16_t>(depth[i] * scale + off);
+        float val = depth[i] * scale + off;
+        val = std::max(0.0f, std::min(65535.0f, val));
+        result[i] = static_cast<uint16_t>(val);
     }
 #endif
     return result;
